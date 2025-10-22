@@ -1,0 +1,5 @@
+spotify_token.json
+cert.pem
+key.pem
+.env*
+!.env.example
