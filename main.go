@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"time"
 
 	"github.com/eiannone/keyboard"
@@ -37,6 +41,12 @@ type ShortcutAction struct {
 
 var oauthConfig *oauth2.Config
 
+//go:embed cert.pem
+var certPEM []byte
+
+//go:embed key.pem
+var keyPEM []byte
+
 func init() {
 	// Load .env file if it exists (won't error if file doesn't exist)
 	godotenv.Load()
@@ -45,8 +55,8 @@ func init() {
 	clientID = getEnv("EZSPOTIFY_CLIENT_ID", "")
 	clientSecret = getEnv("EZSPOTIFY_CLIENT_SECRET", "")
 	localPort = getEnv("EZSPOTIFY_LOCAL_PORT", "9120")
-	certFile = getEnv("EZSPOTIFY_CERT_FILE", "cert.pem")
-	keyFile = getEnv("EZSPOTIFY_KEY_FILE", "key.pem")
+	certFile = getEnv("EZSPOTIFY_CERT_FILE", "")
+	keyFile = getEnv("EZSPOTIFY_KEY_FILE", "")
 	redirectURL = "https://127.0.0.1:" + localPort + "/callback"
 
 	if clientID == "" || clientSecret == "" {
@@ -67,12 +77,12 @@ func init() {
 
 	// Load keyboard shortcuts from environment
 	shortcuts = map[rune]ShortcutAction{
-		rune(getEnv("EZSPOTIFY_KEY_PLAY_PAUSE", " ")[0]): {Name: "Play/Pause", Action: togglePlayback},
-		rune(getEnv("EZSPOTIFY_KEY_NEXT", "n")[0]):       {Name: "Next Track", Action: nextTrack},
-		rune(getEnv("EZSPOTIFY_KEY_PREV", "p")[0]):       {Name: "Previous Track", Action: previousTrack},
-		rune(getEnv("EZSPOTIFY_KEY_VOLUME_UP", "+")[0]):  {Name: "Volume Up", Action: volumeUp},
+		rune(getEnv("EZSPOTIFY_KEY_PLAY_PAUSE", " ")[0]):  {Name: "Play/Pause", Action: togglePlayback},
+		rune(getEnv("EZSPOTIFY_KEY_NEXT", "n")[0]):        {Name: "Next Track", Action: nextTrack},
+		rune(getEnv("EZSPOTIFY_KEY_PREV", "p")[0]):        {Name: "Previous Track", Action: previousTrack},
+		rune(getEnv("EZSPOTIFY_KEY_VOLUME_UP", "+")[0]):   {Name: "Volume Up", Action: volumeUp},
 		rune(getEnv("EZSPOTIFY_KEY_VOLUME_DOWN", "-")[0]): {Name: "Volume Down", Action: volumeDown},
-		rune(getEnv("EZSPOTIFY_KEY_MUTE", "m")[0]):       {Name: "Mute", Action: mute},
+		rune(getEnv("EZSPOTIFY_KEY_MUTE", "m")[0]):        {Name: "Mute", Action: mute},
 	}
 }
 
@@ -81,6 +91,25 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "rundll32"
+		args = []string{"url.dll,FileProtocolHandler", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default: // Linux, BSD, etc.
+		cmd = "xdg-open"
+		args = []string{url}
+	}
+
+	return exec.Command(cmd, args...).Start()
 }
 
 func main() {
@@ -137,6 +166,39 @@ func main() {
 	}
 }
 
+// createHttpsServer creates an HTTPS server with the provided or embedded TLS certificates.
+func createHttpsServer() *http.Server {
+	// Read TLS certificates from file if configured in environment
+	if certFile != "" && keyFile != "" {
+		data, err := os.ReadFile(certFile)
+		if err != nil {
+			log.Printf("Failed to read certificate file: %v\nFalling back to embedded key,cert pair\n", err)
+		} else {
+			certPEM = data
+
+			data, err = os.ReadFile(keyFile)
+			if err != nil {
+				log.Printf("Failed to read key file: %v\nFalling back to embedded key,cert pair\n", err)
+			} else {
+				keyPEM = data
+			}
+		}
+	}
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		log.Fatalf("Failed to load TLS certificates: %v", err)
+	}
+
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{cert}}
+	server := &http.Server{
+		Addr:      "127.0.0.1:" + localPort,
+		TLSConfig: tlsConfig,
+	}
+
+	return server
+}
+
 func listenMediaKeys(client *http.Client) {
 	evChan := hook.Start()
 	defer hook.End()
@@ -177,7 +239,6 @@ func authenticate() (*oauth2.Token, error) {
 	codeChan := make(chan string)
 	errChan := make(chan error)
 
-	server := &http.Server{Addr: "127.0.0.1:" + localPort}
 	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != state {
 			errChan <- fmt.Errorf("state mismatch")
@@ -194,10 +255,15 @@ func authenticate() (*oauth2.Token, error) {
 		codeChan <- code
 	})
 
-	go server.ListenAndServeTLS(certFile, keyFile)
+	server := createHttpsServer()
+
+	go server.ListenAndServeTLS("", "")
 	defer server.Shutdown(context.Background())
 
 	fmt.Println("Opening browser for authorization...")
+	if err := openBrowser(authURL); err != nil {
+		log.Printf("Failed to open browser: %v", err)
+	}
 	fmt.Println("If browser doesn't open, visit this URL:")
 	fmt.Println(authURL)
 
@@ -221,12 +287,12 @@ func authenticate() (*oauth2.Token, error) {
 
 func createAutoRefreshClient(token *oauth2.Token) *http.Client {
 	tokenSource := oauthConfig.TokenSource(context.Background(), token)
-	
+
 	// Wrap token source to save refreshed tokens
 	wrappedSource := &autoSaveTokenSource{
 		src: tokenSource,
 	}
-	
+
 	return oauth2.NewClient(context.Background(), wrappedSource)
 }
 
